@@ -75,11 +75,11 @@ def load_simulation(folder):
 
 def find_fastest_route(network, start, destination):
     """Later, return (route as a list of locations, total travel time)."""
-    # TODO: Add the first routing algorithm after choosing it.
+    # TODO: Add the second routing algorithm after choosing it.
     # Use each connection's 'time', which already includes its traffic delay.
     # A start equal to the destination should return ([start], 0).
     # If no route exists, return ([], float('inf')).
-    raise NotImplementedError('The first routing algorithm has not been chosen yet.')
+    raise NotImplementedError('The second routing algorithm has not been chosen yet.')
 
 
 def dispatch_calls(ambulances, network, calls, log_path):
@@ -140,3 +140,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
