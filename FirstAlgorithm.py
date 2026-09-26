@@ -1,67 +1,181 @@
-"""Ambulance dispatch prototype: first routing algorithm is not added yet.
+"""Ambulance dispatch using Dijkstra.
 
-Run this file to preview the first 10 calls in priority order:
-    python FirstAlgorithm.py
+Start reading at main() below. Both files follow the same design:
+    load the files -> sort calls -> compare ambulances -> log -> reset.
+Only the route-search section differs between the two programs.
 
-After implementing find_fastest_route(), run the dispatch simulation:
-    python FirstAlgorithm.py --dispatch
-
-The design uses /var/log/ambulance_call_log.csv for the log. For Windows
-practice, choose a local file instead:
-    python FirstAlgorithm.py --dispatch --log ambulance_call_log.csv
+Run all calls:  python FirstAlgorithm.py
+Preview only:  python FirstAlgorithm.py --preview
+See BEGINNER_GUIDE.md for examples and a map to the application design.
 """
 
-import argparse  # Reads optional settings typed after the script name.
-import csv       # Reads and writes comma-separated value (CSV) files.
-import math      # Checks for invalid numbers such as infinity.
-from pathlib import Path  # Builds file paths on Windows or Linux.
-from time import perf_counter  # Measures elapsed time in seconds.
+import argparse  # Optional command-line settings, such as --preview.
+import csv       # Read input rows and write dispatch records.
+import heapq     # A queue that gives us the smallest value first.
+import math      # Check whether a number is finite.
+from pathlib import Path  # File paths that work on Windows and Linux.
+from time import perf_counter  # Measure computer calculation time.
 
 
-def read_rows(folder, filename, required_fields):
-    """Read a CSV into a list of dictionaries and check required values."""
-    # A dictionary stores named values, such as row['Call Type'].
-    # A list stores multiple rows in their original file order.
-    file_path = folder / filename
-    with file_path.open(newline='', encoding='utf-8-sig') as file:
-        reader = csv.DictReader(file)
-        column_names = reader.fieldnames
-        if column_names is None:
-            raise ValueError(f'{filename} is empty.')
+# 1. START HERE: run the application
 
-        for field in required_fields:
-            if field not in column_names:
-                raise ValueError(f'{filename} is missing the {field} column.')
+def main():
+    """Read settings, load the data, and preview or dispatch calls."""
+    # __file__ is this Python file. Its parent is the folder containing it.
+    # This finds data even when you run the script from a different folder.
+    data_folder = Path(__file__).parent / 'data'
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-dir', type=Path, default=data_folder,
+                        help='Folder containing the four simulation CSV files.')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--preview', action='store_true',
+                      help='Show the first 10 calls without dispatching.')
+    # Keep --dispatch working for anyone using the earlier command.
+    mode.add_argument('--dispatch', action='store_true',
+                      help='Dispatch all calls (also the default behavior).')
+    parser.add_argument('--log', type=Path,
+                        default=Path(__file__).parent / 'ambulance_call_log.csv',
+                        help='Log file path. Defaults to ambulance_call_log.csv beside this script.')
+    args = parser.parse_args()
 
-        rows = []
-        for row in reader:
-            for field in required_fields:
-                value = row.get(field)
-                if value is None or value.strip() == '':
-                    raise ValueError(f'{filename} has a missing {field}.')
-                # strip() removes extra spaces before and after a value.
-                row[field] = value.strip()
-            rows.append(row)
+    # Report input or file errors in plain text instead of a long traceback.
+    try:
+        ambulances, network, calls = load_simulation(args.data_dir)
+        print(f'Loaded {len(ambulances)} ambulances, {len(network)} locations, '
+              f'and {len(calls)} calls.')
 
-    # The file closes automatically when the 'with' block ends.
-    if len(rows) == 0:
-        raise ValueError(f'{filename} has no data rows.')
-    return rows
+        if not args.preview:
+            # Create the output folder if a custom log path needs one.
+            args.log.parent.mkdir(parents=True, exist_ok=True)
+            dispatch_calls(ambulances, network, calls, args.log)
+            print(f'Completed {len(calls)} simulated dispatches.')
+            print(f'Log saved to: {args.log.resolve()}')
+        else:
+            print('First 10 calls in dispatch order:')
+            # [:10] takes up to the first 10 items in the list.
+            for call in calls[:10]:
+                print(f"Call {call['Call ID']}: {call['Call Type']}, "
+                      f"priority {call['Priority']}")
+            print('Preview only. Run without --preview to dispatch all calls.')
+    except (OSError, ValueError) as error:
+        parser.exit(1, f'{error}\n')
+
+# 2. DISPATCH: choose an ambulance for each call
+
+def dispatch_calls(ambulances, network, calls, log_path):
+    """Compare fastest routes and log each ambulance assignment."""
+    total_execution_time = 0.0
+
+    # 1. Take the next call from the already sorted list.
+    for call in calls:
+        # Reset the best choice for each new call.
+        selected_ambulance = None  # None means no ambulance chosen yet.
+        best_route = []
+        best_travel_time = float('inf')
+
+        # 2. Compare the route from every ambulance staging location.
+        for ambulance in ambulances:
+            # The design starts every route at the ambulance's staging location.
+            start = ambulance['Staging Location']
+
+            # Measure computer calculation time, not simulated driving time.
+            start_time = perf_counter()
+            route, travel_time = find_fastest_route(network, start, call['Location'])
+            stop_time = perf_counter()
+            total_execution_time += stop_time - start_time
+
+            # Skip an ambulance if it cannot reach the call.
+            if not route or not math.isfinite(travel_time):
+                continue
+
+            # A strictly smaller time wins. On a tie, keep the first ambulance.
+            if travel_time < best_travel_time:
+                selected_ambulance = ambulance
+                best_route = route
+                best_travel_time = travel_time
+
+        if selected_ambulance is None:
+            raise ValueError(f"No ambulance can reach call {call['Call ID']}.")
+
+        # 3. Move the chosen ambulance to the call and record the result.
+        selected_ambulance['Current Location'] = call['Location']
+        log_dispatch(call, selected_ambulance, best_route, best_travel_time, log_path)
+
+        # 4. Reset immediately so the ambulance is ready for the next call.
+        selected_ambulance['Current Location'] = selected_ambulance['Staging Location']
+
+    print(f'Total route calculation time: {total_execution_time:.6f} seconds')
+    return total_execution_time
+
+# 3. ROUTE SEARCH: Dijkstra
+
+def find_fastest_route(network, start, destination):
+    """Use Dijkstra's algorithm to return the fastest route and its time."""
+    # Both algorithms minimize travel time INCLUDING traffic delay.
+    # The loader checks that all road times are nonnegative.
+    if start not in network or destination not in network:
+        raise ValueError('The start and destination must exist in the network.')
+    if start == destination:
+        return [start], 0.0  # The ambulance is already at the call.
+
+    # Infinity means we have not found a route to this location yet.
+    best_times = {}
+    previous_locations = {}
+    for location in network:
+        best_times[location] = float('inf')
+        previous_locations[location] = None
+    best_times[start] = 0.0
+
+    # A heap is a priority queue: heappop() removes the smallest item.
+    # Each entry is (travel time so far, location). The time is compared first.
+    # If times tie, Python compares the location names for a consistent order.
+    waiting = []
+    heapq.heappush(waiting, (0.0, start))
+
+    while waiting:
+        current_time, current_location = heapq.heappop(waiting)
+
+        # We may have queued this location before finding a faster route to it.
+        # Ignore that older, slower entry if it is still in the queue.
+        if current_time > best_times[current_location]:
+            continue
+
+        # Dijkstra explores the lowest known travel time first. With
+        # nonnegative road times, reaching the destination here is optimal.
+        if current_location == destination:
+            route = build_route(previous_locations, destination)
+            return route, current_time
+
+        # Try extending the current route along each outgoing road.
+        for road in network[current_location]:
+            neighbor = road['end']
+            # Example: 4 units to get here + 3 on this road = 7 to the neighbor.
+            new_time = current_time + road['time']
+
+            # This improvement step is sometimes called "relaxing" an edge.
+            # Equal times need no update; this also avoids looping on zero-time roads.
+            if new_time < best_times[neighbor]:
+                best_times[neighbor] = new_time
+                previous_locations[neighbor] = current_location
+                heapq.heappush(waiting, (new_time, neighbor))
+
+    # An empty queue means every reachable location has been considered.
+    return [], float('inf')
 
 
-def read_nonnegative_number(row, field):
-    """Convert road data from text to a number that is zero or greater."""
-    number = float(row[field])
-    if not math.isfinite(number) or number < 0:
-        raise ValueError(f'{field} must be a finite number that is zero or greater.')
-    return number
+def build_route(previous_locations, destination):
+    """Follow the saved previous locations to rebuild the route in order."""
+    # Example: if C came from B and B came from A, we collect C, B, A.
+    # Reversing that list gives the driving route A, B, C.
+    route = []
+    location = destination
+    while location is not None:
+        route.append(location)
+        location = previous_locations[location]
+    route.reverse()
+    return route
 
-
-def dispatch_order(call):
-    """Give sort() the two values used to put calls in order."""
-    # Python compares priority first, then original row position for ties.
-    return (call['Priority'], call['Arrival Order'])
-
+# 4. INPUT: load the files and put calls in priority order
 
 def load_simulation(folder):
     """Load and check the four simulation files described in the design."""
@@ -139,114 +253,85 @@ def load_simulation(folder):
 
     # There are no arrival timestamps, so file order represents arrival order.
     # All priority 1 calls come first, then priority 2, then priority 3.
+    # Example: priority 1 rows 4 and 9 are handled before priority 2 row 0.
+    # This call ordering is separate from the heap used to choose roads.
     calls.sort(key=dispatch_order)
     return ambulances, network, calls
 
 
-def find_fastest_route(network, start, destination):
-    """Placeholder for the first routing algorithm, as stated in the design."""
-    # TODO: Choose and implement the first algorithm here.
-    # network[start] gives the roads leaving the starting location.
-    # Each road has an 'end', a 'distance', and a delay-adjusted 'time'.
-    # Return two values: the route (a list of locations) and total travel time.
-    # If start == destination, return ([start], 0).
-    # If no route exists, return ([], float('inf')). Infinity means unreachable.
-    raise NotImplementedError('The first routing algorithm has not been chosen yet.')
+def dispatch_order(call):
+    """Give sort() the two values used to put calls in order."""
+    # Python compares priority first, then original row position for ties.
+    return (call['Priority'], call['Arrival Order'])
+
+# 5. SUPPORT: validate input and record output
+
+def read_rows(folder, filename, required_fields):
+    """Read a CSV into a list of dictionaries and check required values."""
+    # A dictionary stores named values, such as row['Call Type'].
+    # A list stores multiple rows in their original file order.
+    file_path = folder / filename
+    with file_path.open(newline='', encoding='utf-8-sig') as file:
+        reader = csv.DictReader(file)
+        column_names = reader.fieldnames
+        if column_names is None:
+            raise ValueError(f'{filename} is empty.')
+
+        for field in required_fields:
+            if field not in column_names:
+                raise ValueError(f'{filename} is missing the {field} column.')
+
+        rows = []
+        for row in reader:
+            for field in required_fields:
+                value = row.get(field)
+                if value is None or value.strip() == '':
+                    raise ValueError(f'{filename} has a missing {field}.')
+                # strip() removes extra spaces before and after a value.
+                row[field] = value.strip()
+            rows.append(row)
+
+    # The file closes automatically when the 'with' block ends.
+    if len(rows) == 0:
+        raise ValueError(f'{filename} has no data rows.')
+    return rows
 
 
-def dispatch_calls(ambulances, network, calls, log_path):
-    """Compare routes and log each assignment once routing is implemented."""
-    total_execution_time = 0.0
-
-    for call in calls:
-        # Reset the best choice for each new call.
-        selected_ambulance = None  # None means no ambulance chosen yet.
-        best_route = []
-        best_travel_time = float('inf')
-
-        for ambulance in ambulances:
-            # The design starts every route at the ambulance's staging location.
-            start = ambulance['Staging Location']
-
-            # Measure computer calculation time, not simulated driving time.
-            start_time = perf_counter()
-            route, travel_time = find_fastest_route(network, start, call['Location'])
-            stop_time = perf_counter()
-            total_execution_time += stop_time - start_time
-
-            # Skip an ambulance if it cannot reach the call.
-            if not route or not math.isfinite(travel_time):
-                continue
-
-            # A strictly smaller time wins. On a tie, keep the first ambulance.
-            if travel_time < best_travel_time:
-                selected_ambulance = ambulance
-                best_route = route
-                best_travel_time = travel_time
-
-        if selected_ambulance is None:
-            raise ValueError(f"No ambulance can reach call {call['Call ID']}.")
-
-        # Simulate arrival, record the assignment, then reset for the next call.
-        selected_ambulance['Current Location'] = call['Location']
-        record = {
-            'Call ID': call['Call ID'],
-            'Call Type': call['Call Type'],
-            'Call Location': call['Location'],
-            'Selected Ambulance': selected_ambulance['Ambulance Number'],
-            'Route to Call Location': ' -> '.join(best_route),
-            'Time to the Call Location': best_travel_time,
-        }
-
-        # Keep the existing log format: one row with named fields per call.
-        # 'a' means append, so earlier log entries are kept.
-        log_fields = []
-        for name, value in record.items():
-            log_fields.append(f'{name}={value}')
-        with log_path.open('a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(log_fields)
-
-        selected_ambulance['Current Location'] = selected_ambulance['Staging Location']
-
-    print(f'Total route calculation time: {total_execution_time:.6f} seconds')
-    return total_execution_time
+def read_nonnegative_number(row, field):
+    """Convert road data from text to a number that is zero or greater."""
+    number = float(row[field])
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f'{field} must be a finite number that is zero or greater.')
+    return number
 
 
-def main():
-    """Read settings, load the data, and preview or dispatch calls."""
-    # __file__ is this Python file. Its parent is the folder containing it.
-    # This finds data even when you run the script from a different folder.
-    data_folder = Path(__file__).parent / 'data'
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data-dir', type=Path, default=data_folder,
-                        help='Folder containing the four simulation CSV files.')
-    parser.add_argument('--dispatch', action='store_true',
-                        help='Run dispatch after implementing the routing algorithm.')
-    parser.add_argument('--log', type=Path,
-                        default=Path('/var/log/ambulance_call_log.csv'),
-                        help='Log file path. Use a local path for Windows practice.')
-    args = parser.parse_args()
+def log_dispatch(call, selected_ambulance, best_route, best_travel_time, log_path):
+    """Append one dispatch record and display it on the screen."""
+    record = {
+        'Call ID': call['Call ID'],
+        'Call Type': call['Call Type'],
+        'Call Location': call['Location'],
+        'Selected Ambulance': selected_ambulance['Ambulance Number'],
+        'Route to Call Location': ' -> '.join(best_route),
+        'Time to the Call Location': best_travel_time,
+    }
 
-    # Report input or file errors in plain text instead of a long traceback.
-    try:
-        ambulances, network, calls = load_simulation(args.data_dir)
-        print(f'Loaded {len(ambulances)} ambulances, {len(network)} locations, '
-              f'and {len(calls)} calls.')
+    # Keep the existing log format: one row with named fields per call.
+    # 'a' means append, so earlier log entries are kept.
+    log_fields = []
+    for name, value in record.items():
+        log_fields.append(f'{name}={value}')
+    with log_path.open('a', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(log_fields)
 
-        if args.dispatch:
-            dispatch_calls(ambulances, network, calls, args.log)
-        else:
-            print('First 10 calls in dispatch order:')
-            # [:10] takes up to the first 10 items in the list.
-            for call in calls[:10]:
-                print(f"Call {call['Call ID']}: {call['Call Type']}, "
-                      f"priority {call['Priority']}")
-            print('Preview only. Choose and add a routing algorithm before dispatching.')
-    except (OSError, ValueError, NotImplementedError) as error:
-        parser.exit(1, f'{error}\n')
+    # Show the assignment so the simulation's progress is visible.
+    print(f"Call {call['Call ID']} (priority {call['Priority']}): "
+          f"{selected_ambulance['Ambulance Number']} -> {call['Location']}")
+    print(f"  Route: {' -> '.join(best_route)}")
+    print(f"  Travel time including traffic: {best_travel_time:.2f}")
 
 
-# Start here when running this file directly. Importing it does not run main().
-if __name__ == '__main__':
+# Python defines the functions above first, then starts main() here.
+if __name__ == "__main__":
     main()
